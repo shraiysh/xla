@@ -6281,6 +6281,152 @@ CreateCudnnFlashAttentionCausalMaskTensor(
   return mask_out_tensor;
 }
 
+absl::StatusOr<std::shared_ptr<cudnn_frontend::graph::Graph>>
+GetCudnnFlashAttentionOperationGraph(
+    CudnnHandle& cudnn, const dnn::MatmulTensorDescriptor& q_descriptor,
+    const dnn::MatmulTensorDescriptor& k_descriptor,
+    const dnn::MatmulTensorDescriptor& v_descriptor,
+    const dnn::TensorDescriptor& o_descriptor,
+    std::optional<dnn::TensorDescriptor> bias_descriptor,
+    std::optional<dnn::TensorDescriptor> mask_descriptor,
+    std::optional<dnn::TensorDescriptor> stats_descriptor, bool use_dropout,
+    std::optional<double> dropout_rate, bool is_causal_mask) {
+  using Graph = cudnn_frontend::graph::Graph;
+  using Tensor_attributes = cudnn_frontend::graph::Tensor_attributes;
+  using SDPA_attributes = cudnn_frontend::graph::SDPA_attributes;
+
+  if (VLOG_IS_ON(4)) {
+    VLOG(4) << "\n bmm1_lhs(q): " << q_descriptor.ToString()
+            << "\n bmm1_rhs(k): " << k_descriptor.ToString()
+            << "\n bmm2_rhs(v): " << v_descriptor.ToString()
+            << "\n out(o): " << o_descriptor.ToString();
+    if (bias_descriptor) {
+      VLOG(4) << "\n bias(b): " << bias_descriptor->ToString();
+    }
+    if (mask_descriptor) {
+      VLOG(4) << "\n mask(m): " << mask_descriptor->ToString();
+    }
+    if (stats_descriptor) {
+      VLOG(4) << "\n activation(s): " << stats_descriptor->ToString();
+    }
+  }
+
+  std::shared_ptr<Graph> graph = std::make_shared<Graph>();
+  dnn::DataType q_type = q_descriptor.type();
+  dnn::DataType k_type = k_descriptor.type();
+  dnn::DataType v_type = v_descriptor.type();
+  dnn::DataType o_type = o_descriptor.type();
+  if (!(q_type == k_type && k_type == v_type && v_type == o_type)) {
+    return absl::InternalError("Input datatypes do not match");
+  }
+  cudnn_frontend::DataType_t ioDataType =
+      cudnn_frontend::detail::convert_from_cudnn_type(ToCudnnDataType(q_type));
+
+  graph->set_intermediate_data_type(cudnn_frontend::DataType_t::FLOAT)
+      .set_io_data_type(ioDataType)
+      .set_compute_data_type(cudnn_frontend::DataType_t::FLOAT);
+
+  std::shared_ptr<Tensor_attributes> q_tensor = graph->tensor(
+      Tensor_attributes()
+          .set_name("Q")
+          .set_dim(q_descriptor.GetCudnnCompatibleDimensions(true))
+          .set_stride(q_descriptor.GetCudnnCompatibleStrides(true))
+          .set_uid(CudnnfMHAUid::Q_ID));
+  std::shared_ptr<Tensor_attributes> k_tensor = graph->tensor(
+      Tensor_attributes()
+          .set_name("K")
+          .set_dim(k_descriptor.GetCudnnCompatibleDimensions(true))
+          .set_stride(k_descriptor.GetCudnnCompatibleStrides(true))
+          .set_uid(CudnnfMHAUid::K_ID));
+  std::shared_ptr<Tensor_attributes> v_tensor = graph->tensor(
+      Tensor_attributes()
+          .set_name("V")
+          .set_dim(v_descriptor.GetCudnnCompatibleDimensions(false))
+          .set_stride(v_descriptor.GetCudnnCompatibleStrides(false))
+          .set_uid(CudnnfMHAUid::V_ID));
+
+  // Setting sdpa, and is_inference
+  SDPA_attributes sdpa_options =
+      SDPA_attributes()
+          .set_name("flash_attention")
+          .set_is_inference(stats_descriptor == std::nullopt);
+
+  // Setting bias
+  std::shared_ptr<Tensor_attributes> bias = nullptr;
+  if (bias_descriptor.has_value()) {
+    auto bias_tensor =
+        graph->tensor(Tensor_attributes()
+                          .set_name("bias")
+                          .set_dim(bias_descriptor->dimensions())
+                          .set_stride(bias_descriptor->GetLogicalStrides())
+                          .set_uid(CudnnfMHAUid::BIAS_ID));
+    sdpa_options.set_bias(bias_tensor);
+  }
+  // Setting seed and bias
+  if (use_dropout && dropout_rate.has_value() && *dropout_rate > 0.0) {
+    auto seed_tensor =
+        graph->tensor(Tensor_attributes()
+                          .set_name("seed")
+                          .set_dim({1, 1, 1, 1})
+                          .set_stride({1, 1, 1, 1})
+                          .set_data_type(cudnn_frontend::DataType_t::INT64)
+                          .set_is_pass_by_value(true)
+                          .set_uid(CudnnfMHAUid::D_SEED_ID));
+    auto offset_tensor =
+        graph->tensor(Tensor_attributes()
+                          .set_name("offset")
+                          .set_dim({1, 1, 1, 1})
+                          .set_stride({1, 1, 1, 1})
+                          .set_data_type(cudnn_frontend::DataType_t::INT64)
+                          .set_is_pass_by_value(true)
+                          .set_uid(CudnnfMHAUid::D_OFFSET_ID));
+    sdpa_options.set_dropout((float)dropout_rate.value(), seed_tensor,
+                             offset_tensor);
+  }
+
+  // Causal mask?
+  sdpa_options.set_causal_mask(is_causal_mask);
+
+  // Setting attention scale.
+  auto alpha_scale_tensor =
+      graph->tensor(Tensor_attributes()
+                        .set_name("alpha_scale")
+                        .set_dim({1, 1, 1, 1})
+                        .set_stride({1, 1, 1, 1})
+                        .set_is_pass_by_value(true)
+                        .set_uid(CudnnfMHAUid::ALPHA_SCALE_ID));
+  sdpa_options.set_attn_scale(alpha_scale_tensor);
+
+  // Add SDPA to the graph.
+  auto [o_tensor, stats_tensor] =
+      graph->sdpa(q_tensor, k_tensor, v_tensor, sdpa_options);
+
+  // Set output attributes.
+  o_tensor->set_output(true)
+      .set_dim(o_descriptor.dimensions())
+      .set_stride(o_descriptor.GetLogicalStrides())
+      .set_uid(CudnnfMHAUid::O_ID);
+  if (stats_descriptor.has_value()) {
+    cudnn_frontend::DataType_t statsType =
+        cudnn_frontend::detail::convert_from_cudnn_type(
+            ToCudnnDataType(stats_descriptor->type()));
+    stats_tensor->set_output(true).set_data_type(statsType).set_uid(
+        CudnnfMHAUid::P_ID);
+  }
+
+  RETURN_IF_CUDNN_FRONTEND_ERROR(graph->validate());
+  RETURN_IF_CUDNN_FRONTEND_ERROR(graph->build_operation_graph(cudnn.handle()));
+  RETURN_IF_CUDNN_FRONTEND_ERROR(graph->check_support(cudnn.handle()));
+  RETURN_IF_CUDNN_FRONTEND_ERROR(
+      graph->create_execution_plans({cudnn_frontend::HeurMode_t::A}));
+  RETURN_IF_CUDNN_FRONTEND_ERROR(graph->build_plans(cudnn.handle()));
+
+  if (VLOG_IS_ON(4)) {
+    VLOG(4) << "\b flash attention operation graph: " << *graph;
+  }
+  return graph;
+}
+
 absl::StatusOr<cudnn_frontend::Tensor>
 CreateCudnnFlashAttentionDropoutBwdTensor(
     std::vector<cudnn_frontend::Operation>& ops, absl::Span<const int64_t> dims,
@@ -8836,150 +8982,6 @@ CudnnSupport::NormRunnerFromDesc(
 #endif  // CUDNN_VERSION >= 8905
 }
 
-absl::StatusOr<CudnnGraphRunner<dnn::FusedMHASignature>>
-GetCudnnFlashAttentionGraphRunner(
-    GpuExecutor* parent_, CudnnHandle& cudnn, CudnnAccess* cudnn_,
-    const dnn::MatmulTensorDescriptor& q_descriptor,
-    const dnn::MatmulTensorDescriptor& k_descriptor,
-    const dnn::MatmulTensorDescriptor& v_descriptor,
-    const dnn::TensorDescriptor& o_descriptor,
-    std::optional<dnn::TensorDescriptor> bias_descriptor,
-    std::optional<dnn::TensorDescriptor> mask_descriptor,
-    std::optional<dnn::TensorDescriptor> stats_descriptor,
-    std::optional<int64_t> seed, std::optional<double> dropout_rate,
-    bool is_causal_mask, double scale, int64_t dropout_rng_offset) {
-  using Graph = cudnn_frontend::graph::Graph;
-  using Tensor_attributes = cudnn_frontend::graph::Tensor_attributes;
-  using SDPA_attributes = cudnn_frontend::graph::SDPA_attributes;
-  std::shared_ptr<Graph> graph = std::make_shared<Graph>();
-  cudnnDataType_t q_type = ToCudnnDataType(q_descriptor.type());
-  cudnnDataType_t k_type = ToCudnnDataType(k_descriptor.type());
-  cudnnDataType_t v_type = ToCudnnDataType(v_descriptor.type());
-  cudnnDataType_t o_type = ToCudnnDataType(o_descriptor.type());
-  if (!(q_type == k_type && k_type == v_type && v_type == o_type)) {
-    return absl::InternalError("Input datatypes do not match");
-  }
-
-  graph->set_intermediate_data_type(cudnn_frontend::DataType_t::FLOAT)
-      .set_io_data_type(cudnn_frontend::detail::convert_from_cudnn_type(q_type))
-      .set_compute_data_type(cudnn_frontend::DataType_t::FLOAT);
-
-  std::shared_ptr<Tensor_attributes> q_tensor = graph->tensor(
-      Tensor_attributes()
-          .set_name("Q")
-          .set_dim(q_descriptor.GetCudnnCompatibleDimensions(true))
-          .set_stride(q_descriptor.GetCudnnCompatibleStrides(true))
-          .set_uid(CudnnfMHAUid::Q_ID));
-  std::shared_ptr<Tensor_attributes> k_tensor = graph->tensor(
-      Tensor_attributes()
-          .set_name("K")
-          .set_dim(k_descriptor.GetCudnnCompatibleDimensions(true))
-          .set_stride(k_descriptor.GetCudnnCompatibleStrides(true))
-          .set_uid(CudnnfMHAUid::K_ID));
-  std::shared_ptr<Tensor_attributes> v_tensor = graph->tensor(
-      Tensor_attributes()
-          .set_name("V")
-          .set_dim(v_descriptor.GetCudnnCompatibleDimensions(false))
-          .set_stride(v_descriptor.GetCudnnCompatibleStrides(false))
-          .set_uid(CudnnfMHAUid::V_ID));
-
-  std::vector<std::optional<CudnnfMHAUid>> uids = {Q_ID, K_ID, V_ID, O_ID,
-                                                   /*mask=*/std::nullopt};
-
-  // Setting sdpa, and is_inference
-  SDPA_attributes sdpa_options =
-      SDPA_attributes()
-          .set_name("flash_attention")
-          .set_is_inference(stats_descriptor == std::nullopt);
-
-  // Setting bias
-  std::shared_ptr<Tensor_attributes> bias = nullptr;
-  if (bias_descriptor.has_value()) {
-    auto bias_tensor =
-        graph->tensor(Tensor_attributes()
-                          .set_name("bias")
-                          .set_dim(bias_descriptor->dimensions())
-                          .set_stride(bias_descriptor->GetLogicalStrides())
-                          .set_uid(CudnnfMHAUid::BIAS_ID));
-    uids.push_back(BIAS_ID);
-    sdpa_options.set_bias(bias_tensor);
-  } else {
-    uids.push_back(std::nullopt);
-  }
-
-  // Setting seed and bias
-  int64_t dropout_rng_seed = seed.has_value() ? *seed : 0;
-  if (dropout_rate.has_value()) {
-    auto seed_tensor =
-        graph->tensor(Tensor_attributes()
-                          .set_name("seed")
-                          .set_dim({1, 1, 1, 1})
-                          .set_stride({1, 1, 1, 1})
-                          .set_data_type(cudnn_frontend::DataType_t::INT64)
-                          .set_is_pass_by_value(true)
-                          .set_uid(CudnnfMHAUid::D_SEED_ID));
-    auto offset_tensor =
-        graph->tensor(Tensor_attributes()
-                          .set_name("offset")
-                          .set_dim({1, 1, 1, 1})
-                          .set_stride({1, 1, 1, 1})
-                          .set_data_type(cudnn_frontend::DataType_t::INT64)
-                          .set_is_pass_by_value(true)
-                          .set_uid(CudnnfMHAUid::D_OFFSET_ID));
-    sdpa_options.set_dropout((float)dropout_rate.value(), seed_tensor,
-                             offset_tensor);
-  }
-
-  // Causal mask?
-  sdpa_options.set_causal_mask(is_causal_mask);
-
-  // Setting attention scale.
-  auto alpha_scale_tensor =
-      graph->tensor(Tensor_attributes()
-                        .set_name("alpha_scale")
-                        .set_dim({1, 1, 1, 1})
-                        .set_stride({1, 1, 1, 1})
-                        .set_is_pass_by_value(true)
-                        .set_uid(CudnnfMHAUid::ALPHA_SCALE_ID));
-  sdpa_options.set_attn_scale(alpha_scale_tensor);
-  ScalingParam attn_scale_val(scale, dnn::kFloat);
-
-  // Add SDPA to the graph.
-  auto [o_tensor, stats_tensor] =
-      graph->sdpa(q_tensor, k_tensor, v_tensor, sdpa_options);
-
-  // Set output attributes.
-  o_tensor->set_output(true)
-      .set_dim(o_descriptor.dimensions())
-      .set_stride(o_descriptor.GetLogicalStrides())
-      .set_data_type(cudnn_frontend::detail::convert_from_cudnn_type(o_type))
-      .set_uid(CudnnfMHAUid::O_ID);
-  if (stats_descriptor.has_value()) {
-    cudnn_frontend::DataType_t statsType =
-        cudnn_frontend::detail::convert_from_cudnn_type(
-            ToCudnnDataType(stats_descriptor->type()));
-    stats_tensor->set_output(true).set_data_type(statsType).set_uid(
-        CudnnfMHAUid::P_ID);
-    uids.push_back(P_ID);
-  } else {
-    uids.push_back(std::nullopt);
-  }
-
-  RETURN_IF_CUDNN_FRONTEND_ERROR(graph->validate());
-  RETURN_IF_CUDNN_FRONTEND_ERROR(graph->build_operation_graph(cudnn.handle()));
-  RETURN_IF_CUDNN_FRONTEND_ERROR(graph->check_support(cudnn.handle()));
-  RETURN_IF_CUDNN_FRONTEND_ERROR(
-      graph->create_execution_plans({cudnn_frontend::HeurMode_t::A}));
-  RETURN_IF_CUDNN_FRONTEND_ERROR(graph->build_plans(cudnn.handle()));
-
-  TF_ASSIGN_OR_RETURN(
-      auto runner,
-      CudnnGraphRunner<dnn::FusedMHASignature>::Create(
-          parent_, cudnn_, graph, seed.has_value(), dropout_rng_seed,
-          dropout_rng_offset, attn_scale_val, uids));
-  return runner;
-}
-
 // Returns the offset to increment for the dropout rng.
 // The offset is used by runner to increment by the offset_increment for
 // every call to cudnn fmha kernel to make sure dropout mask is evenly
@@ -9013,20 +9015,35 @@ CudnnSupport::FusedMHARunnerFromDesc(
   std::vector<int64_t> intermediate_shape;
 
   if (is_flash_attention) {
+    TF_ASSIGN_OR_RETURN(
+        auto graph,
+        GetCudnnFlashAttentionOperationGraph(
+            cudnn, /*q_descriptor=*/bmm1_lhs_descriptor,
+            /*k_descriptor=*/bmm1_rhs_descriptor,
+            /*v_descriptor=*/bmm2_rhs_descriptor,
+            /*o_descriptor=*/output_descriptor, bias_descriptor,
+            mask_descriptor, /*stats_descriptor=*/activation_descriptor,
+            use_dropout, dropout_rate, is_causal_mask));
+
     std::vector<int64_t> intermediate_bmm2_lhs_dims =
         intermediate_bmm2_lhs_descriptor.GetCudnnCompatibleDimensions(true);
     intermediate_shape = intermediate_bmm2_lhs_dims;
     int64_t dropout_rng_offset = GetDropoutRngOffset(intermediate_shape);
+    int64_t dropout_rng_seed = seed.has_value() ? *seed : 0;
+    ScalingParam attn_scale_val(scale, dnn::kFloat);
+    std::vector<std::optional<CudnnfMHAUid>> uids = {Q_ID, K_ID, V_ID, O_ID,
+                                                     /*mask=*/std::nullopt};
+    uids.emplace_back(bias_descriptor.has_value()
+                          ? std::optional<CudnnfMHAUid>(CudnnfMHAUid::BIAS_ID)
+                          : std::nullopt);
+    uids.emplace_back(activation_descriptor.has_value()
+                          ? std::optional<CudnnfMHAUid>(CudnnfMHAUid::P_ID)
+                          : std::nullopt);
     TF_ASSIGN_OR_RETURN(
         auto runner,
-        GetCudnnFlashAttentionGraphRunner(
-            parent_, cudnn, /*cudnn_=*/cudnn_.get(),
-            /*q_descriptor=*/bmm1_lhs_descriptor,
-            /*k_descriptor=*/bmm1_rhs_descriptor,
-            /*v_descriptor*/ bmm2_rhs_descriptor,
-            /*o_descriptor*/ output_descriptor, bias_descriptor,
-            mask_descriptor, /*stats_descriptor*/ activation_descriptor, seed,
-            dropout_rate, is_causal_mask, scale, dropout_rng_offset));
+        CudnnGraphRunner<dnn::FusedMHASignature>::Create(
+            parent_, cudnn_.get(), graph, /*has_dropout=*/seed.has_value(),
+            dropout_rng_seed, dropout_rng_offset, attn_scale_val, uids));
 
     return {std::make_unique<CudnnGraphRunner<dnn::FusedMHASignature>>(
         std::move(runner))};
