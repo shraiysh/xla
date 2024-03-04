@@ -65,7 +65,7 @@ class CudnnGraph : public dnn::DnnGraph {
   absl::Status Build(int64_t plan_id) override;
   absl::Status Execute(Stream& stream,
                        absl::Span<DeviceMemoryBase> operands) const override;
-  const cudnn_frontend::graph::Graph& Graph() { return graph_; }
+  const cudnn_frontend::graph::Graph& Graph() const { return graph_; }
 
  private:
   cudnn_frontend::graph::Graph graph_;
