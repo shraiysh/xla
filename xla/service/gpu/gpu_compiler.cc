@@ -862,6 +862,10 @@ absl::Status GpuCompiler::OptimizeHloModule(
     TF_RETURN_IF_ERROR(pipeline.Run(hlo_module).status());
   }
 
+  HloPassPipeline iteration_attribute_pipeline("iteration-attribute-add");
+  TF_RETURN_IF_ERROR(iteration_attribute_pipeline.Run(hlo_module).status());
+
+
   const bool enable_all_pipelined = hlo_module->config()
                                         .debug_options()
                                         .xla_gpu_enable_pipelined_collectives();
