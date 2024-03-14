@@ -3711,6 +3711,7 @@ cc_library(
         "//xla/service:buffer_assignment",
         "//xla/service:call_inliner",
         "//xla/service:collective_permute_decomposer",
+        "//xla/service/spmd:collective_permute_iteration_instances",
         "//xla/service:collective_pipeliner",
         "//xla/service:collectives_schedule_linearizer",
         "//xla/service:comparison_expander",

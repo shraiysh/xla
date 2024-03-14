@@ -230,6 +230,36 @@ xla_cc_test(
 )
 
 cc_library(
+    name = "collective_permute_iteration_instances",
+    srcs = ["collective_permute_iteration_instances.cc"],
+    hdrs = ["collective_permute_iteration_instances.h"],
+    deps = [
+        "//xla:comparison_util",
+        "//xla:shape_util",
+        "//xla/hlo/ir:hlo",
+        "//xla/service:hlo_pass",
+        "//xla/service:while_loop_analysis",
+        "@com_google_absl//absl/algorithm:container",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/container:flat_hash_set",
+    ],
+)
+
+xla_cc_test(
+    name = "collective_permute_iteration_instances_test",
+    srcs = ["collective_permute_iteration_instances_test.cc"],
+    deps = [
+        ":collective_permute_iteration_instances",
+        "//xla:xla_data_proto_cc",
+        "//xla/hlo/utils:hlo_matchers",
+        "//xla/tests:hlo_test_base",
+        "//xla/tests:xla_internal_test_main",
+        "//xla/service:while_loop_trip_count_annotator",
+    ],
+)
+
+
+cc_library(
     name = "collective_permute_motion",
     srcs = ["collective_permute_motion.cc"],
     hdrs = ["collective_permute_motion.h"],
