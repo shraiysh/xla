@@ -160,6 +160,7 @@ cc_library(
     hdrs = ["hlo_instruction_utils.h"],
     deps = [
         ":hlo",
+        "//xla/service:pattern_matcher",
         "@com_google_absl//absl/algorithm:container",
     ],
 )

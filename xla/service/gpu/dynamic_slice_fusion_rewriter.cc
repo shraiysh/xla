@@ -36,6 +36,7 @@ limitations under the License.
 #include "xla/ffi/ffi_api.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_instruction.h"
+#include "xla/hlo/ir/hlo_instruction_utils.h"
 #include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/hlo/ir/hlo_schedule.h"
@@ -199,6 +200,16 @@ UseDefDataflowPaths GetSlicedOperandPaths(const HloInstruction* instr) {
   return sliced_operand_paths;
 }
 
+bool IsConstantOrLoopIterationOffset(const HloDynamicIndexInstruction &instr) {
+  for(const HloInstruction *offset : instr.index_operands()) {
+    if(hlo_instruction_utils::IsLoopIterationNumber(offset) || offset->IsConstant()) {
+      continue;
+    }
+    return false;
+  }
+  return true;
+}
+
 // Each user of `instr` that goes into a DUS will have an entry in the returned
 // vector.
 // Each entry contains the sliced paths for that user, i.e. the sequence of ops
@@ -231,7 +242,13 @@ DefUseDataflowPaths GetSlicedUserPaths(const HloInstruction* instr) {
         },
         /*visit_operands=*/false);
     if (maybe_dus_instr == std::nullopt) return;
-    if (dus_found || processed_instrs.contains(maybe_dus_instr.value())) {
+    // Only transform 
+    auto dynamic_index_operation =
+        DynCast<HloDynamicIndexInstruction>(maybe_dus_instr.value());
+    bool valid_dus_found =
+        dus_found && dynamic_index_operation &&
+        IsConstantOrLoopIterationOffset(*dynamic_index_operation);
+    if (valid_dus_found || processed_instrs.contains(maybe_dus_instr.value())) {
       // Even in the case of stopping at a match that has been processed, we
       // still need to add instructions encountered in the sliced user path
       // during the latest traversal.
@@ -400,13 +417,29 @@ absl::StatusOr<bool> DynamicSliceFusionRewriter::Run(
   // Collect all potential custom call matches in the non-fusion computations.
   for (HloComputation* computation : module->computations()) {
     if (computation->IsFusionComputation()) continue;
+    VLOG(2) << "Running on computation: " << computation->name();
     for (HloInstruction* instr : computation->instructions()) {
       if (IsLegacyCublasMatmul(*instr) ||
           (IsCustomCall(instr, platform_name_))) {
         UseDefDataflowPaths sliced_operand_paths = GetSlicedOperandPaths(instr);
+        VLOG(2) << "Sliced operand paths : {"
+                << absl::StrJoin(sliced_operand_paths, ",",
+                                 [](std::string* out, HloInstruction* instr) {
+                                   out->append(instr->name());
+                                 })
+                << "}";
         bool has_sliced_operand_paths = sliced_operand_paths.size() > 1;
 
         DefUseDataflowPaths sliced_user_paths = GetSlicedUserPaths(instr);
+        VLOG(2) << sliced_user_paths.size() << " sliced user paths";
+        for(auto &path : sliced_user_paths) {
+          VLOG(2) << "\t{"
+                  << absl::StrJoin(path, ",",
+                                   [](std::string* out, HloInstruction* instr) {
+                                     out->append(instr->name());
+                                   })
+                  << "}";
+        }
         bool has_sliced_user_paths = absl::c_any_of(
             sliced_user_paths,
             [&](auto& sliced_user_path) { return !sliced_user_path.empty(); });
@@ -420,6 +453,7 @@ absl::StatusOr<bool> DynamicSliceFusionRewriter::Run(
         }
 
         if (has_sliced_operand_paths || has_sliced_user_paths) {
+          VLOG(1) << "Found match for " << instr->name();
           matches[instr] = std::make_pair(std::move(sliced_operand_paths),
                                           std::move(sliced_user_paths));
         }
@@ -449,6 +483,8 @@ absl::StatusOr<bool> DynamicSliceFusionRewriter::Run(
         CreateFusionBody(module, sliced_operand_paths,
                          DataflowPathsView(sliced_user_paths_view), captures));
 
+    VLOG(2) << "Emitted fusion body:";
+    XLA_VLOG_LINES(2, fusion_body->ToString());
     bool has_dynamic_slices = absl::c_any_of(matched_instrs, [&](auto* instr) {
       return DynCast<HloDynamicIndexInstruction>(instr) != nullptr;
     });
@@ -456,9 +492,11 @@ absl::StatusOr<bool> DynamicSliceFusionRewriter::Run(
         HloInstruction * fusion,
         CreateFusionInstruction(module, hero, captures, fusion_body,
                                 has_dynamic_slices));
+    VLOG(2) << "Created fusion instruction: " << fusion->ToString();
 
     HloComputation* parent = hero->parent();
     if (fusion->shape().IsTuple()) {
+      VLOG(9) << "Replacing " << hero->name() << " with " << fusion->name();
       TF_RETURN_IF_ERROR(parent->ReplaceInstructionWithDifferentShape(
           const_cast<HloInstruction*>(hero), fusion));
       for (auto& sliced_user_path : sliced_user_paths) {
@@ -491,6 +529,7 @@ absl::StatusOr<bool> DynamicSliceFusionRewriter::Run(
       } else {
         instr_to_be_replaced = sliced_user_paths.front().back();
       }
+      VLOG(1) << "Replacing " << instr_to_be_replaced->name() << " with new fusion instruction " << fusion->name();
       TF_RETURN_IF_ERROR(
           parent->ReplaceInstruction(instr_to_be_replaced, fusion));
     }

@@ -3313,6 +3313,7 @@ cc_library(
         "//xla/ffi:ffi_api",
         "//xla/ffi/api:c_api",
         "//xla/hlo/ir:hlo",
+        "//xla/hlo/ir:hlo_instruction_utils",
         "//xla/service:custom_call_target_registry",
         "//xla/service:hlo_pass",
         "//xla/service/gpu/kernels:custom_fusion_library",

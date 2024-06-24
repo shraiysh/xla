@@ -1563,6 +1563,136 @@ TEST_F(DynamicSliceFusionRewriterTest, DUSSimpleGemm) {
                             expected);
 }
 
+TEST_F(DynamicSliceFusionRewriterTest, DUSSimpleGemmLoopIteration) {
+  const char* hlo = R"(
+  HloModule test
+
+  offset_computation {
+    p = u32[] parameter(0)
+    c11 = u32[] constant(11)
+    c0 = u32[] constant(0)
+    add = add(p, c11)
+    compare = compare(p, c0), direction=LT
+    ROOT select = select(compare, add, p)
+  }
+
+  add_fusion {
+    p = u32[] parameter(0)
+    c1 = u32[] constant(1)
+    ROOT add = add(p, c1)
+  }
+
+  %Body {
+    %param = (f16[1,8,8]{2,1,0}, f16[1,8,8]{2,1,0}, f16[4,8,8]{2,1,0}, u32[]) parameter(0)
+    %p0 = get-tuple-element(%param), index=0
+    %p1 = get-tuple-element(%param), index=1
+    %p2 = get-tuple-element(%param), index=2
+    %loop_iter = get-tuple-element(%param), index=3
+    %bitcast.41 = f16[8,8]{1,0} bitcast(%p0)
+    %bitcast.42 = f16[8,8]{1,0} bitcast(%p1)
+    %custom-call.1 = f16[8,8]{1,0} custom-call(%bitcast.41, %bitcast.42), custom_call_target="__cublas$gemm", backend_config={"gemm_backend_config":{
+          "alpha_real":1,
+          "beta":0,
+          "dot_dimension_numbers":{
+          "lhs_contracting_dimensions":["1"],
+          "rhs_contracting_dimensions":["0"],
+          "lhs_batch_dimensions":[],
+          "rhs_batch_dimensions":[]
+          },
+          "alpha_imag":0,
+          "precision_config":{"operand_precision":["DEFAULT","DEFAULT"]},
+          "epilogue":"DEFAULT",
+          "lhs_stride":"64",
+          "rhs_stride":"64",
+          "grad_x":false,
+          "grad_y":false
+      }}
+    %bitcast.43 = f16[1,8,8]{2,1,0} bitcast(%custom-call.1)
+    %offset = u32[] fusion(%loop_iter), kind=kLoop, calls=offset_computation
+    %c0 = u32[] constant(0)
+    %dus = f16[4,8,8]{2,1,0} dynamic-update-slice(%p2, %bitcast.43, %offset, %c0, %c0)
+    %c1 = u32[] constant(1)
+    %add = u32[] fusion(%loop_iter), kind=kLoop, calls=add_fusion
+    ROOT %tuple = tuple(%p0, %p1, %dus, u32[] %add)
+  }
+
+  %Cond {
+    %param.1 = (f16[1,8,8]{2,1,0}, f16[1,8,8]{2,1,0}, f16[4,8,8]{2,1,0}, u32[]) parameter(0)
+    %i.1 = u32[] get-tuple-element(%param.1), index=3
+    %trip_count = u32[] constant(11)
+    ROOT %done = pred[] compare(u32[] %i.1, u32[] %trip_count), direction=LT
+  }
+
+  ENTRY %test {
+    %p0.1 = f16[1,8,8]{2,1,0} parameter(0)
+    %p1.1 = f16[1,8,8]{2,1,0} parameter(1)
+    %p2.1 = f16[4,8,8]{2,1,0} parameter(2)
+    %c0.1 = u32[] constant(0)
+    %initial_tuple = tuple(%p0.1, %p1.1, %p2.1, u32[] %c0.1)
+    ROOT %while = while(%initial_tuple), condition=%Cond, body=%Body, backend_config={"known_trip_count":{"n":"11"}}
+  })";
+
+  const char* expected = R"(
+  // CHECK: %Body{{.+}}{
+  // CHECK:   %[[PARAM:.+]] = {{.+}} parameter(0)
+  // CHECK:   %[[LOOP_ITER:.+]] = u32[] get-tuple-element(%[[PARAM]]), index=3
+  // CHECK:   %[[OFFSET:.+]] = u32[] fusion(%[[LOOP_ITER]]), kind=kLoop, calls=%{{.+}}
+  // CHECK:   %[[ADDRESS_COMPUTATION:.+]] = {{.+}} fusion({{.+}}, {{.+}}, {{.+}}, %[[OFFSET]], %{{.+}}), kind=kCustom, calls=%address-computation, backend_config={{.+}}"custom_fusion_config":{"name":"dynamic_address_computation"}
+  // CHECK:   %[[ADD:.+]] = u32[] fusion(%[[LOOP_ITER]]), kind=kLoop, calls=%{{.+}}
+  // CHECK:   ROOT %tuple = {{.+}} tuple(%{{.+}}, %{{.+}}, %[[ADDRESS_COMPUTATION]], %[[ADD]])
+  // CHECK: }
+  // CHECK: ENTRY %test{{.+}}{
+  // CHECK:   ROOT %{{.+}} = {{.+}} while(%{{.+}}), condition=%{{.+}}, body=%Body{{.*}}, backend_config={"known_trip_count":{"n":"11"}}
+  }
+  )";
+
+  auto device = TestGpuDeviceInfo::RTXA6000DeviceInfo();
+  RunAndFilecheckHloRewrite(hlo, DynamicSliceFusionRewriter(PLATFORM),
+                            expected);
+}
+
+TEST_F(DynamicSliceFusionRewriterTest, DUSSimpleGemmParameterOffset) {
+  const char* hlo = R"(
+      HloModule test
+
+    ENTRY main.9 {
+      p0 = f16[1,8,8]{2,1,0} parameter(0)
+      p1 = f16[1,8,8]{2,1,0} parameter(1)
+      p2 = f16[4,8,8]{2,1,0} parameter(2)
+      p3 = s32[] parameter(3)
+      c1_s32 = s32[] constant(1)
+      c0_s32 = s32[] constant(0)
+      bitcast.41 = f16[8,8]{1,0} bitcast(p0)
+      bitcast.42 = f16[8,8]{1,0} bitcast(p1)
+
+      custom-call.1 = f16[8,8]{1,0} custom-call(bitcast.41, bitcast.42),
+        custom_call_target="__cublas$gemm",
+        backend_config={"gemm_backend_config":{
+          "alpha_real":1,
+          "beta":0,
+          "dot_dimension_numbers":{
+            "lhs_contracting_dimensions":["1"],
+            "rhs_contracting_dimensions":["0"],
+            "lhs_batch_dimensions":[],
+            "rhs_batch_dimensions":[]
+          },
+          "alpha_imag":0,
+          "precision_config":{"operand_precision":["DEFAULT","DEFAULT"]},
+          "epilogue":"DEFAULT",
+          "lhs_stride":"64",
+          "rhs_stride":"64",
+          "grad_x":false,
+          "grad_y":false
+        }}
+      bitcast.43 = f16[1,8,8]{2,1,0} bitcast(custom-call.1)
+      ROOT dus = f16[4,8,8]{2,1,0} dynamic-update-slice(p2, bitcast.43, p3, c0_s32, c0_s32)
+    })";
+
+  auto device = TestGpuDeviceInfo::RTXA6000DeviceInfo();
+  RunAndFilecheckHloRewrite(hlo, DynamicSliceFusionRewriter(PLATFORM),
+                            std::nullopt);
+}
+
 TEST_F(DynamicSliceFusionRewriterTest, DUSSimpleGemmNotRoot) {
   const char* hlo = R"(
     HloModule test
