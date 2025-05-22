@@ -293,20 +293,29 @@ int main(int argc, char** argv) {
   // Modifies global DebugOptions, populates flags with every flag available
   // from xla.proto.
   xla::AppendDebugOptionsFlags(&flag_list);
+  VLOG(1) << "xla_cpu_max_isa: " << xla::GetDebugOptionsFromFlags().xla_cpu_max_isa();
+
+
+  // The usage string includes the message at the top of the file, the
+  // DebugOptions flags and the flags defined above.
+  const std::string kUsageString =
+      absl::StrCat(kUsage, "\n\n", tsl::Flags::Usage(argv[0], flag_list));
+  tsl::port::InitMain(kUsageString.c_str(), &argc, &argv);
+
+  VLOG(1) << "xla_cpu_max_isa: " << xla::GetDebugOptionsFromFlags().xla_cpu_max_isa();
 
   std::optional<absl::string_view> debugOptionsFilename =
       xla::GetDebugOptionsFileName(argc, argv);
   if (debugOptionsFilename.has_value()) {
     xla::ParseFlagsFromDebugOptionsFile(debugOptionsFilename.value());
   }
-  xla::ParseDebugOptionFlagsFromEnv(true);
+  VLOG(1) << "xla_cpu_max_isa: " << xla::GetDebugOptionsFromFlags().xla_cpu_max_isa();
 
-  // The usage string includes the message at the top of the file, the
-  // DebugOptions flags and the flags defined above.
-  const std::string kUsageString =
-      absl::StrCat(kUsage, "\n\n", tsl::Flags::Usage(argv[0], flag_list));
+  xla::ParseDebugOptionFlagsFromEnv(true);
+  VLOG(1) << "xla_cpu_max_isa: " << xla::GetDebugOptionsFromFlags().xla_cpu_max_isa();
+
   bool parse_ok = tsl::Flags::Parse(&argc, argv, flag_list);
-  tsl::port::InitMain(kUsageString.c_str(), &argc, &argv);
+  VLOG(1) << "xla_cpu_max_isa: " << xla::GetDebugOptionsFromFlags().xla_cpu_max_isa();
 
   if (!parse_ok) {
     LOG(QFATAL) << kUsageString;
